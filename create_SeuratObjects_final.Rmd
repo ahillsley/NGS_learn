@@ -1,0 +1,308 @@
+---
+title: "cellranger-based Shu-Hsien scATAC-seq"
+output: html_notebook
+---
+# Introduction
+
+In this analysis we rely on cellranger-atac count to filter cell barcodes.
+
+
+
+```{r}
+
+library(Signac)
+library(Seurat)
+library(GenomeInfoDb)
+library(EnsDb.Mmusculus.v79)
+library(ggplot2)
+library(patchwork)
+library(hdf5r)
+library(GenomicRanges)
+library(future)
+# plan("multiprocess", workers = 4)
+library(JASPAR2020)
+library(TFBSTools)
+library(BSgenome.Mmusculus.UCSC.mm10)
+library(patchwork)
+library(rtracklayer)
+library(stringr)
+options(future.globals.maxSize = 12000 * 1024^2) # for 12 Gb RAM
+set.seed(1234)
+
+```
+
+# Load data
+
+Using the approach described here: https://satijalab.org/signac/0.2/articles/merging.html
+First create separate ChromatinAssay objects with their own peaks under "ATAC" assay.  Then create a new "peaks" assay with unified peaks within each object, and merge.
+
+```{r}
+
+# load peak sets
+peaks.WT <- read.table(
+  file = "~/Documents/temp_stuff_Dropbox/labs/clapham/shu-hsien/10x_data/WT/peaks.bed",
+  col.names = c("chr", "start", "end")
+)
+peaks.KO <- read.table(
+  file = "~/Documents/temp_stuff_Dropbox/labs/clapham/shu-hsien/10x_data/KO/peaks.bed",
+  col.names = c("chr", "start", "end")
+)
+
+```
+
+Load in counts and metadata.
+```{r}
+
+counts.WT <- Read10X_h5(filename = "~/Documents/temp_stuff_Dropbox/labs/clapham/shu-hsien/10x_data/WT/filtered_peak_bc_matrix.h5")
+metadata.WT <- read.csv(
+  file = "~/Documents/temp_stuff_Dropbox/labs/clapham/shu-hsien/10x_data/WT/singlecell.csv",
+  sep = ",",
+  header = TRUE,
+  row.names = 1
+)[-1,]
+
+counts.KO <- Read10X_h5(filename = "~/Documents/temp_stuff_Dropbox/labs/clapham/shu-hsien/10x_data/KO/filtered_peak_bc_matrix.h5")
+metadata.KO <- read.csv(
+  file = "~/Documents/temp_stuff_Dropbox/labs/clapham/shu-hsien/10x_data/KO/singlecell.csv",
+  sep = ",",
+  header = TRUE,
+  row.names = 1
+)[-1,]
+
+# get the filtered barcodes from cellranger
+cellbarcodes.WT <- read.delim(file = "~/Documents/temp_stuff_Dropbox/labs/clapham/shu-hsien/10x_data/WT/barcodes.tsv", sep = "\t", header = F)
+cellbarcodes.KO <- read.delim(file = "~/Documents/temp_stuff_Dropbox/labs/clapham/shu-hsien/10x_data/KO/barcodes.tsv", sep = "\t", header = F)
+colnames(cellbarcodes.WT) <- "cells"
+colnames(cellbarcodes.KO) <- "cells"
+
+# perform an initial filtering of low count cells determined by cellranger
+metadata.WT <- metadata.WT[cellbarcodes.WT$cells, ]
+metadata.KO <- metadata.KO[cellbarcodes.KO$cells, ]
+
+
+
+```
+
+Load fragments
+```{r}
+frags.WT <- CreateFragmentObject(
+  path = "~/Documents/temp_stuff_Dropbox/labs/clapham/shu-hsien/10x_data/WT/fragments.tsv.gz",
+  cells = rownames(metadata.WT)
+)
+
+frags.KO <- CreateFragmentObject(
+  path = "~/Documents/temp_stuff_Dropbox/labs/clapham/shu-hsien/10x_data/KO/fragments.tsv.gz",
+  cells = rownames(metadata.KO)
+)
+
+
+```
+
+Now we have the cellranger filtered counts, native peaks, and fragments.  Create ChromatinAssay and make SeuratObjects for each library.
+```{r}
+
+chrom_assay.WT <- CreateChromatinAssay(
+  counts = counts.WT,
+  sep = c(":", "-"),
+  genome = "mm10",
+  fragments = frags.WT
+)
+
+chrom_assay.KO <- CreateChromatinAssay(
+  counts = counts.KO,
+  sep = c(":", "-"),
+  genome = "mm10",
+  fragments = frags.KO
+)
+
+
+so.WT <- CreateSeuratObject(
+  counts = chrom_assay.WT,
+  assay = "ATAC",
+  meta.data = metadata.WT, project = "HTR6"
+)
+
+so.KO <- CreateSeuratObject(
+  counts = chrom_assay.KO,
+  assay = "ATAC",
+  meta.data = metadata.KO, project = "HTR6"
+)
+
+so.WT
+so.KO
+
+
+```
+
+Create unified peaks.
+```{r}
+
+
+combined.peaks <- UnifyPeaks(object.list = list(so.WT, so.KO), mode = "reduce")
+peakwidths <- width(combined.peaks)
+combined.peaks <- combined.peaks[peakwidths  < 10000 & peakwidths > 20]
+
+combined.peaks
+
+```
+
+Create FeatureMatrix with unified peaks.
+```{r}
+
+peakcount.WT <- FeatureMatrix(
+  fragments = frags.WT,
+  features = combined.peaks,
+  cells = cellbarcodes.WT$cells
+)
+
+peakcount.KO <- FeatureMatrix(
+  fragments = frags.KO,
+  features = combined.peaks,
+  cells = cellbarcodes.KO$cells
+)
+
+```
+
+Create 'peaks' assay slot
+```{r}
+
+so.WT[['peaks']] <- CreateChromatinAssay(
+  counts = peakcount.WT,
+  sep = c(":", "-"),
+  genome = SeqinfoForUCSCGenome("mm10"),
+  fragments = frags.WT
+  )
+so.KO[['peaks']] <- CreateChromatinAssay(
+  counts = peakcount.KO,
+  sep = c(":", "-"),
+  genome = SeqinfoForUCSCGenome("mm10"),
+  fragments = frags.KO
+  )
+
+so.WT$dataset <- "WT"
+so.KO$dataset <- "KO"
+
+
+```
+
+# Merge data
+
+
+```{r}
+
+combined <- merge(x = so.WT, y = so.KO, add.cell.ids = c("WT", "KO"))
+
+```
+
+
+Create filtered_merged_fragments.tsv.gz with "WT" and "KO" cell barcode prefixes
+
+```{r}
+
+fpath <- "~/Documents/temp_stuff_Dropbox/labs/clapham/shu-hsien/10x_data/filtered_merged_fragments.tsv.gz"
+frags.combined <- CreateFragmentObject(fpath, cells = Cells(combined))
+
+Fragments(object = combined[['peaks']]) <-  NULL
+Fragments(object = combined[['peaks']]) <- frags.combined
+
+```
+
+Normalize, reduce, cluster
+```{r}
+
+DefaultAssay(combined) <- "peaks"
+combined <- RunTFIDF(combined)
+combined <- FindTopFeatures(combined, min.cutoff = 20)
+combined <- RunSVD(
+  combined,
+  reduction.key = 'LSI_',
+  reduction.name = 'lsi',
+  irlba.work = 400
+)
+combined <- RunUMAP(combined, dims = 2:30, reduction = 'lsi')
+combined <- FindNeighbors(object = combined, reduction = 'lsi', dims = 2:30)
+combined <- FindClusters(object = combined, verbose = FALSE, algorithm = 3)
+
+```
+
+
+Examine the combined object cell clustering.
+```{r}
+
+DimPlot(object = combined, label = TRUE, pt.size = 0.1)
+DimPlot(combined, group.by = 'dataset', pt.size = 0.1)
+DimPlot(combined, split.by = 'dataset', label = TRUE, pt.size = 0.1) + NoLegend()
+
+```
+## Add motifs and genes
+
+Add Ensembl annotations and JASPAR2020 motifs.
+```{r}
+
+# extract gene annotations from EnsDb
+annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Mmusculus.v79)
+
+# change to UCSC style since the data was mapped to mm10
+
+# weird temporary fix because UCSC patch update broke GenomeInfoDb issue #27
+# ucsc.levels <- str_replace(string=paste("chr",seqlevels(annotations),sep=""), pattern="chrMT", replacement="chrM")
+# seqlevels(annotations) <- ucsc.levels
+# seqlevelsStyle(annotations) <- 'UCSC'
+
+seqlevelsStyle(annotations) <- 'UCSC'
+genome(annotations) <- "mm10"
+
+
+# add the gene information to the object
+Annotation(combined) <- annotations
+
+pfm <- getMatrixSet(
+  x = JASPAR2020,
+  opts = list(species = 10090, all_versions = FALSE)
+)
+
+combined <- AddMotifs(
+  object = combined,
+  genome = BSgenome.Mmusculus.UCSC.mm10,
+  pfm = pfm
+)
+
+Annotation(combined[['ATAC']]) <- annotations
+combined[['ATAC']] <- AddMotifs(
+  object = combined[['ATAC']],
+  genome = BSgenome.Mmusculus.UCSC.mm10,
+  pfm = pfm
+)
+
+
+combined[["ATAC"]]
+combined[["peaks"]]
+
+```
+
+
+# Save data
+
+Save objects as starting point for the next workbook.  (CHANGE PATHS)
+```{r}
+
+
+saveRDS(combined, file = "~/Documents/temp_stuff_Dropbox/labs/clapham/shu-hsien/final_analysis/combined_SOs.rds")
+
+save(list = c("counts.KO", "counts.WT", "peakcount.WT", "peakcount.KO", "frags.KO", "frags.WT", "frags.combined", "so.WT", "so.KO", "annotations"), file = "~/Documents/temp_stuff_Dropbox/labs/clapham/shu-hsien/final_analysis/large_pieces.rds")
+
+
+```
+
+Save everything just in case.   (CHANGE PATHS)
+```{r}
+
+save.image(file = "~/Documents/temp_stuff_Dropbox/labs/clapham/shu-hsien/final_analysis/just_in_case_final.RData")
+
+```
+
+
+## Done
+
+This workbook creates the SeuratObject (combined) for downstream analysis.  The next notebook ("final_analysis.Rmd") loads the combined object and continues with downstream analysis.
+
